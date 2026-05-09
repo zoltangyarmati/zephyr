@@ -1,0 +1,36 @@
+# Copyright (c) 2025 STMicroelectronics
+# SPDX-License-Identifier: Apache-2.0
+
+config UHC_STM32
+	bool "STM32 USB host controller driver"
+	depends on DT_HAS_ST_STM32_UHC_OTGHS_ENABLED || DT_HAS_ST_STM32N6_UHC_OTGHS_ENABLED
+	select USE_STM32_LL_USB
+	select USE_STM32_HAL_HCD
+	select STM32_USB_COMMON
+	select PINCTRL
+	default y
+	help
+	  STM32 USB host controller (UHC) driver using the DWC2 OTG HS core.
+
+if UHC_STM32
+
+config UHC_STM32_STACK_SIZE
+	int "UHC driver thread stack size"
+	default 512
+	help
+	  Stack size for the STM32 UHC driver worker thread.
+
+config UHC_STM32_THREAD_PRIORITY
+	int "UHC driver thread priority"
+	default 8
+	help
+	  Priority for the STM32 UHC driver worker thread.
+
+config UHC_STM32_MAX_QMESSAGES
+	int "Maximum number of ISR event messages"
+	range 4 64
+	default 8
+	help
+	  Maximum number of messages queued from ISR callbacks to the worker thread.
+
+endif # UHC_STM32

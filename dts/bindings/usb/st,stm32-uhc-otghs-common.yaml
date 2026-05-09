@@ -1,0 +1,25 @@
+# Copyright (c) 2025, STMicroelectronics
+# SPDX-License-Identifier: Apache-2.0
+
+# Common fields for STM32 OTGHS USB host controller
+
+include: [usb-controller.yaml, pinctrl-device.yaml]
+
+properties:
+  reg:
+    required: true
+
+  interrupts:
+    required: true
+
+  ram-size:
+    type: int
+    required: true
+    description: Size of USB dedicated SRAM in bytes.
+
+  phys:
+    type: phandle
+    description: PHY provider specifier
+
+  clocks:
+    required: true

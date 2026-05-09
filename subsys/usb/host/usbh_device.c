@@ -301,8 +301,11 @@ static int parse_configuration_descriptor(struct usb_device *const udev)
 
 		if (dhp->bDescriptorType == USB_DESC_INTERFACE) {
 			if_desc = (struct usb_if_descriptor *)dhp;
-			LOG_DBG("bInterfaceNumber %u bAlternateSetting %u",
-				if_desc->bInterfaceNumber, if_desc->bAlternateSetting);
+			LOG_INF("bInterfaceNumber %u bAlternateSetting %u class=0x%02x/0x%02x/0x%02x",
+				if_desc->bInterfaceNumber, if_desc->bAlternateSetting,
+				if_desc->bInterfaceClass,
+				if_desc->bInterfaceSubClass,
+				if_desc->bInterfaceProtocol);
 
 			if (if_desc->bAlternateSetting == 0) {
 				if (tmp_nif >= UHC_INTERFACES_MAX) {
@@ -538,14 +541,28 @@ int usbh_device_init(struct usb_device *const udev)
 			LOG_ERR("Failed to signal bus reset");
 			return err;
 		}
+		k_msleep(200);
 	}
 
 	/*
 	 * Limit mps0 to the minimum supported by full-speed devices until the
 	 * device descriptor is read.
+	 * Some devices (notably UVC cameras) STALL or fail to respond to the
+	 * first GET_DESCRIPTOR after reset.  Retry with re-reset up to 3 times.
+	 * -EPIPE = device sent STALL; -EIO = no response (TXERR × 3).
 	 */
 	udev->dev_desc.bMaxPacketSize0 = 8;
-	err = usbh_req_desc_dev(udev, 8, &udev->dev_desc);
+	for (int retry = 0; retry < 3; retry++) {
+		err = usbh_req_desc_dev(udev, 8, &udev->dev_desc);
+		if (err == 0) {
+			break;
+		}
+		LOG_WRN("GET_DESCRIPTOR failed err %d, retry %d", err, retry + 1);
+		if (usbh_device_is_root(uhs_ctx, udev)) {
+			uhc_bus_reset(uhs_ctx->dev);
+			k_msleep(300);
+		}
+	}
 	if (err) {
 		LOG_ERR("Failed to read device descriptor");
 		goto error;
@@ -579,7 +596,13 @@ int usbh_device_init(struct usb_device *const udev)
 		goto error;
 	}
 
-	LOG_INF("New device with address %u state %u", udev->addr, udev->state);
+	LOG_INF("New device addr=%u VID=0x%04x PID=0x%04x class=0x%02x/0x%02x/0x%02x",
+		udev->addr,
+		sys_le16_to_cpu(udev->dev_desc.idVendor),
+		sys_le16_to_cpu(udev->dev_desc.idProduct),
+		udev->dev_desc.bDeviceClass,
+		udev->dev_desc.bDeviceSubClass,
+		udev->dev_desc.bDeviceProtocol);
 
 	err = usbh_device_set_configuration(udev, 1);
 	if (err) {

@@ -13,7 +13,8 @@
 
 /* Compatible of all STM32 USB controllers */
 #define STM32_USB_COMPATIBLES								\
-	st_stm32_usb, st_stm32_otgfs, st_stm32_otghs
+	st_stm32_usb, st_stm32_otgfs, st_stm32_otghs, st_stm32_uhc_otghs,		\
+	st_stm32n6_uhc_otghs
 
 /* Shorthand to obtain PHY node for an instance */
 #define USB_STM32_PHY(usb_node)			DT_PROP_BY_IDX(usb_node, phys, 0)

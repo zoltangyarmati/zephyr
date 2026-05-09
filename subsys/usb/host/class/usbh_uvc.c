@@ -81,6 +81,7 @@ struct uvc_stream_iface_info {
 	const struct usb_if_descriptor *iface;
 	const struct usb_ep_descriptor *ep;
 	uint32_t ep_mps_mult;
+	bool is_bulk;
 };
 
 struct uvc_format_info {
@@ -104,6 +105,7 @@ struct uvc_host_data {
 	uint8_t expect_frame_id;
 	uint8_t discard_first_frame;
 	bool save_picture;
+	bool bulk_raw_mode;
 	uint8_t video_transfer_count;
 	uint8_t multi_prime_cnt;
 
@@ -111,6 +113,7 @@ struct uvc_host_data {
 	uint32_t transfer_count;
 	uint32_t discard_frame_cnt;
 	uint32_t current_frame_timestamp;
+	uint32_t frame_byte_offset;
 
 	struct video_buffer *current_vbuf;
 	struct uhc_transfer *video_transfer[CONFIG_USBH_VIDEO_CONCURRENT_TRANSFERS];
@@ -130,6 +133,11 @@ struct uvc_host_data {
 	struct video_format_cap format_caps[CONFIG_USBH_VIDEO_MAX_CAPS];
 	uint8_t format_caps_count;
 	struct uvc_probe probe;
+	/* Actual probe/commit control size as reported by the camera (GET_CUR response length).
+	 * Cameras implementing partial UVC versions (e.g. UVC 1.0 = 34 bytes) reject SET_CUR
+	 * with wLength=48, silently ignoring VS_COMMIT and refusing to stream.
+	 */
+	uint8_t probe_ctrl_len;
 	struct uvc_ctrls ctrls;
 };
 
@@ -825,12 +833,19 @@ static bool ep_has_enough_bandwidth(const struct usb_ep_descriptor *ep_desc,
 		ep_mps, ep_tpl, interval,
 		(device_speed == USB_SPEED_SPEED_HS) ? "uframes" : "frames", ep_bandwidth);
 
-	/* Check if this endpoint meets requirements */
-	if (ep_bandwidth >= required_bandwidth && ep_tpl >= max_tpl) {
-		return true;
+	/* Check if this endpoint meets requirements.
+	 * For HS: both bandwidth AND payload size must be satisfied.
+	 * For FS: only check payload size — FS bandwidth (~1 MB/s) can never satisfy the
+	 * theoretical uncompressed bandwidth (e.g. 18 MB/s for YUYV 640x480 @30fps).
+	 * The camera firmware governs the actual frame rate over FS; the host just needs
+	 * ep_mps >= dwMaxPayloadTransferSize to receive each UVC payload chunk. */
+	if (ep_tpl < max_tpl) {
+		return false;
 	}
-
-	return false;
+	if (device_speed == USB_SPEED_SPEED_HS && ep_bandwidth < required_bandwidth) {
+		return false;
+	}
+	return true;
 }
 
 /* Calculate endpoint bandwidth */
@@ -920,6 +935,35 @@ scan_interface_endpoints(const struct usb_if_descriptor *const if_desc,
 	return best_ep;
 }
 
+/* Find a bulk IN endpoint in the given streaming interface alternate */
+static const struct usb_ep_descriptor *
+find_bulk_in_endpoint(const struct usb_if_descriptor *const if_desc)
+{
+	const struct usb_desc_header *desc;
+	const struct usb_ep_descriptor *ep_desc;
+
+	if (if_desc == NULL) {
+		return NULL;
+	}
+
+	desc = (const struct usb_desc_header *)if_desc;
+	while ((desc = usbh_desc_get_next(desc)) != NULL) {
+		/* Stop when we reach the next interface descriptor */
+		if (desc->bDescriptorType == USB_DESC_INTERFACE) {
+			break;
+		}
+		if (desc->bDescriptorType == USB_DESC_ENDPOINT) {
+			ep_desc = (const void *)desc;
+			if ((ep_desc->bmAttributes & USB_EP_TRANSFER_TYPE_MASK) ==
+				    USB_EP_TYPE_BULK &&
+			    (ep_desc->bEndpointAddress & USB_EP_DIR_MASK) == USB_EP_DIR_IN) {
+				return ep_desc;
+			}
+		}
+	}
+	return NULL;
+}
+
 /* Select streaming alternate setting based on bandwidth */
 static int select_streaming_alternate(struct uvc_host_data *const host_data,
 				      uint32_t required_bandwidth)
@@ -934,6 +978,28 @@ static int select_streaming_alternate(struct uvc_host_data *const host_data,
 	uint32_t optimal_bandwidth = UINT32_MAX;
 	uint32_t selected_payload_size = 0;
 	uint32_t ep_bandwidth;
+
+	/* Cap required_bandwidth to max_tpl × fps.
+	 * For compressed formats (JPEG/MJPEG) the call site uses fmt->size×fps which is the
+	 * worst-case decoded buffer size, not the actual USB data rate.  The real per-second
+	 * USB data rate is at most max_tpl per frame interval.  Any isochronous endpoint with
+	 * ep_tpl >= max_tpl has far more per-second capacity than max_tpl×fps needs, so the
+	 * bandwidth check only needs to pass that lower bound.  For uncompressed formats the
+	 * call site already passes the correct value; the cap is harmless because an endpoint
+	 * with ep_tpl == max_tpl also has ep_bandwidth >> max_tpl×fps. */
+	if (max_tpl > 0U) {
+		uint32_t frmival = sys_le32_to_cpu(host_data->probe.dwFrameInterval);
+		uint32_t max_tpl_bw = (frmival > 0U)
+				      ? (uint32_t)(max_tpl *
+						   ((NSEC_PER_SEC / 100ULL) / frmival))
+				      : 0U;
+
+		if (max_tpl_bw > 0U && required_bandwidth > max_tpl_bw) {
+			LOG_DBG("Capping required_bandwidth %u -> %u (max_tpl=%u x fps)",
+				required_bandwidth, max_tpl_bw, max_tpl);
+			required_bandwidth = max_tpl_bw;
+		}
+	}
 
 	LOG_DBG("Required bandwidth: %u bytes/sec, Max payload: %u bytes (device speed: %s)",
 		required_bandwidth, max_tpl,
@@ -967,6 +1033,27 @@ static int select_streaming_alternate(struct uvc_host_data *const host_data,
 	}
 
 	if (selected_endpoint == NULL) {
+		/* No isochronous alternates: fall back to bulk IN endpoint.
+		 * Check alt 0 first (stream_info->iface), then any alternates. */
+		selected_endpoint = find_bulk_in_endpoint(stream_info->iface);
+
+		for (uint8_t i = 0;
+		     selected_endpoint == NULL &&
+		     i < CONFIG_USBH_VIDEO_MAX_STREAM_INTERFACE_ALT &&
+		     host_data->stream_iface_alts[i] != NULL;
+		     i++) {
+			selected_endpoint =
+				find_bulk_in_endpoint(host_data->stream_iface_alts[i]);
+		}
+
+		if (selected_endpoint != NULL) {
+			LOG_INF("No isochronous alternates, using bulk IN EP 0x%02x (payload=%u)",
+				selected_endpoint->bEndpointAddress, max_tpl);
+			stream_info->ep = selected_endpoint;
+			stream_info->ep_mps_mult = max_tpl;
+			stream_info->is_bulk = true;
+			return 0;
+		}
 		LOG_ERR("No EP satisfies bandwidth %u and payload size %u", required_bandwidth,
 			max_tpl);
 		return -ENOTSUP;
@@ -1033,6 +1120,15 @@ static int vs_get(struct uvc_host_data *const host_data, const uint8_t request,
 
 		if (buf->len != data_len) {
 			LOG_WRN("VS GET: expected %u bytes, got %zu bytes", data_len, buf->len);
+			/* Record camera's actual probe control size so SET_CUR uses matching
+			 * wLength — some cameras silently ignore VS_COMMIT if wLength is wrong.
+			 */
+			if (buf->len < data_len &&
+			    (host_data->probe_ctrl_len == 0 ||
+			     buf->len < host_data->probe_ctrl_len)) {
+				host_data->probe_ctrl_len = (uint8_t)buf->len;
+				LOG_INF("VS probe ctrl size: %u bytes", host_data->probe_ctrl_len);
+			}
 		}
 
 		LOG_DBG("VS GET received %zu bytes", buf->len);
@@ -1054,7 +1150,7 @@ cleanup:
 
 /* Send VideoStreaming SET request  */
 static int vs_set(struct uvc_host_data *const host_data, const uint8_t request,
-		  const uint8_t control_selector, const void *data, const uint8_t data_len)
+		  const uint8_t control_selector, const void *data, uint8_t data_len)
 {
 	const struct usb_if_descriptor *stream_iface = host_data->current_stream_iface_info.iface;
 	uint8_t bmRequestType;
@@ -1065,6 +1161,13 @@ static int vs_set(struct uvc_host_data *const host_data, const uint8_t request,
 	if (data_len == 0) {
 		LOG_ERR("Invalid data length: %u", data_len);
 		return -EINVAL;
+	}
+
+	/* Use the camera's actual probe control length if known — sending a wLength larger than
+	 * what the camera understands causes it to silently ignore VS_COMMIT and refuse to stream.
+	 */
+	if (host_data->probe_ctrl_len > 0 && data_len > host_data->probe_ctrl_len) {
+		data_len = host_data->probe_ctrl_len;
 	}
 
 	if (stream_iface == NULL) {
@@ -1189,6 +1292,10 @@ static int set_format(struct uvc_host_data *const host_data,
 		LOG_ERR("PROBE GET request failed: %d", ret);
 		return ret;
 	}
+	LOG_INF("Probe negotiated: fmt=%u frame=%u interval=%u maxPayload=%u",
+		host_data->probe.bFormatIndex, host_data->probe.bFrameIndex,
+		sys_le32_to_cpu(host_data->probe.dwFrameInterval),
+		sys_le32_to_cpu(host_data->probe.dwMaxPayloadTransferSize));
 
 	/* COMMIT */
 	ret = vs_request(host_data, UVC_SET_CUR, UVC_VS_COMMIT_CONTROL,
@@ -1218,9 +1325,31 @@ static int set_format(struct uvc_host_data *const host_data,
 	host_data->current_format.frame_ptr = frame;
 	k_mutex_unlock(&host_data->lock);
 
-	/* Calculate required bandwidth */
-	byte_per_sec = host_data->current_format.video_fmt.size *
-		       ((NSEC_PER_SEC / 100ULL) / host_data->current_format.frmival_100ns);
+	/* Calculate required bandwidth.
+	 * fmt->size is a worst-case decoded-buffer estimate for compressed formats (JPEG).
+	 * Prefer the probe-negotiated values which reflect actual USB data rates:
+	 *   1. dwMaxVideoFrameSize: exact compressed frame size (may be 0 if camera omits it)
+	 *   2. dwMaxPayloadTransferSize × fps: payload per interval × fps; conservative lower
+	 *      bound — an endpoint that can carry one payload per frame interval is sufficient
+	 *      because the endpoint's per-second capacity still dwarfs the data rate
+	 *   3. fmt->size: uncompressed buffer size, correct for raw formats, over-estimates
+	 *      for compressed ones (fall back only when probe fields are both 0) */
+	{
+		uint32_t max_frame_size =
+			sys_le32_to_cpu(host_data->probe.dwMaxVideoFrameSize);
+		uint32_t max_payload =
+			sys_le32_to_cpu(host_data->probe.dwMaxPayloadTransferSize);
+
+		if (max_frame_size == 0U && max_payload > 0U) {
+			max_frame_size = max_payload;
+		}
+		if (max_frame_size == 0U) {
+			max_frame_size = host_data->current_format.video_fmt.size;
+		}
+		byte_per_sec = max_frame_size *
+			       ((NSEC_PER_SEC / 100ULL) /
+				host_data->current_format.frmival_100ns);
+	}
 	if (byte_per_sec == 0) {
 		LOG_WRN("Cannot calculate required bandwidth");
 		return -EINVAL;
@@ -1235,17 +1364,22 @@ static int set_format(struct uvc_host_data *const host_data,
 
 	stream_iface = stream_info->iface;
 
-	/* Configure streaming interface */
-	ret = usbh_device_interface_set(host_data->udev, stream_iface->bInterfaceNumber,
-					stream_iface->bAlternateSetting, false);
-	if (ret != 0) {
-		LOG_ERR("Failed to set streaming interface %u alternate %u: %d",
-			stream_iface->bInterfaceNumber, stream_iface->bAlternateSetting, ret);
-		return ret;
-	}
+	/* For bulk cameras there is no alternate to switch to — VS_COMMIT already tells the
+	 * device to start streaming. Sending SET_INTERFACE(0) after VS_COMMIT resets the
+	 * camera's streaming state and causes it to NAK all subsequent bulk IN transactions.
+	 */
+	if (!stream_info->is_bulk) {
+		ret = usbh_device_interface_set(host_data->udev, stream_iface->bInterfaceNumber,
+						stream_iface->bAlternateSetting, false);
+		if (ret != 0) {
+			LOG_ERR("Failed to set streaming interface %u alternate %u: %d",
+				stream_iface->bInterfaceNumber, stream_iface->bAlternateSetting, ret);
+			return ret;
+		}
 
-	LOG_INF("Set streaming interface %u alternate %u successfully",
-		stream_iface->bInterfaceNumber, stream_iface->bAlternateSetting);
+		LOG_INF("Set streaming interface %u alternate %u successfully",
+			stream_iface->bInterfaceNumber, stream_iface->bAlternateSetting);
+	}
 
 	LOG_INF("UVC format set successfully: %s %ux%u@%ufps",
 		VIDEO_FOURCC_TO_STR(fmt->pixelformat), fmt->width, fmt->height,
@@ -1258,6 +1392,7 @@ static int set_format(struct uvc_host_data *const host_data,
 static int set_frame_rate(const struct device *dev, uint32_t fps)
 {
 	struct uvc_host_data *const host_data = dev->data;
+	struct uvc_stream_iface_info *const stream_info = &host_data->current_stream_iface_info;
 	const struct usb_if_descriptor *stream_iface;
 	struct video_frmival_enum fie = {0};
 	uint32_t best_frmival = 0;
@@ -1328,8 +1463,22 @@ static int set_frame_rate(const struct device *dev, uint32_t fps)
 	LOG_INF("Frame rate successfully set to %u fps",
 		(NSEC_PER_SEC / 100) / host_data->current_format.frmival_100ns);
 
-	byte_per_sec = host_data->current_format.video_fmt.size *
-		       ((NSEC_PER_SEC / 100ULL) / host_data->current_format.frmival_100ns);
+	{
+		uint32_t max_frame_size =
+			sys_le32_to_cpu(host_data->probe.dwMaxVideoFrameSize);
+		uint32_t max_payload =
+			sys_le32_to_cpu(host_data->probe.dwMaxPayloadTransferSize);
+
+		if (max_frame_size == 0U && max_payload > 0U) {
+			max_frame_size = max_payload;
+		}
+		if (max_frame_size == 0U) {
+			max_frame_size = host_data->current_format.video_fmt.size;
+		}
+		byte_per_sec = max_frame_size *
+			       ((NSEC_PER_SEC / 100ULL) /
+				host_data->current_format.frmival_100ns);
+	}
 	if (byte_per_sec == 0) {
 		LOG_ERR("Cannot calculate required bandwidth");
 		return -EINVAL;
@@ -1343,16 +1492,18 @@ static int set_frame_rate(const struct device *dev, uint32_t fps)
 
 	stream_iface = host_data->current_stream_iface_info.iface;
 
-	ret = usbh_device_interface_set(host_data->udev, stream_iface->bInterfaceNumber,
-					stream_iface->bAlternateSetting, false);
-	if (ret != 0) {
-		LOG_ERR("Failed to set streaming interface %u alternate %u: %d",
-			stream_iface->bInterfaceNumber, stream_iface->bAlternateSetting, ret);
-		return ret;
-	}
+	if (!stream_info->is_bulk) {
+		ret = usbh_device_interface_set(host_data->udev, stream_iface->bInterfaceNumber,
+						stream_iface->bAlternateSetting, false);
+		if (ret != 0) {
+			LOG_ERR("Failed to set streaming interface %u alternate %u: %d",
+				stream_iface->bInterfaceNumber, stream_iface->bAlternateSetting, ret);
+			return ret;
+		}
 
-	LOG_INF("Set streaming interface %u alternate %u successfully",
-		stream_iface->bInterfaceNumber, stream_iface->bAlternateSetting);
+		LOG_INF("Set streaming interface %u alternate %u successfully",
+			stream_iface->bInterfaceNumber, stream_iface->bAlternateSetting);
+	}
 
 	return 0;
 }
@@ -1582,6 +1733,7 @@ static int continue_transfer(struct uvc_host_data *const host_data,
 static int stream_iso_req_cb(struct usb_device *const dev, struct uhc_transfer *const xfer)
 {
 	struct uvc_host_data *const host_data = (void *)xfer->priv;
+	struct uvc_stream_iface_info *const stream_info = &host_data->current_stream_iface_info;
 	struct uvc_payload_header *payload_header = NULL;
 	struct video_buffer *vbuf = host_data->current_vbuf;
 	struct net_buf *buf = xfer->buf;
@@ -1592,7 +1744,6 @@ static int stream_iso_req_cb(struct usb_device *const dev, struct uhc_transfer *
 	uint8_t end_frame = 0;
 
 	if (vbuf == NULL) {
-		LOG_DBG("No current buffer available, ignoring callback");
 		goto cleanup;
 	}
 
@@ -1614,8 +1765,34 @@ static int stream_iso_req_cb(struct usb_device *const dev, struct uhc_transfer *
 	payload_header = (void *)buf->data;
 	end_frame = payload_header->bmHeaderInfo & UVC_BMHEADERINFO_END_OF_FRAME;
 	frame_id = payload_header->bmHeaderInfo & UVC_BMHEADERINFO_FRAMEID;
-	presentation_time = sys_get_le32((uint8_t *)&payload_header->dwPresentationTime);
 	header_length = payload_header->bHeaderLength;
+	/* dwPresentationTime is optional — only present when PTS bit is set.
+	 * Reading it unconditionally yields garbage payload bytes, causing false
+	 * timestamp mismatches that reset save_picture and silently drop every frame.
+	 */
+	if (payload_header->bmHeaderInfo & UVC_BMHEADERINFO_HAS_PRESENTATIONTIME) {
+		presentation_time = sys_get_le32((uint8_t *)&payload_header->dwPresentationTime);
+	}
+
+	if (stream_info->is_bulk) {
+		if (host_data->bulk_raw_mode) {
+			/* Transfers after the first are raw JPEG — no UVC header. Override all
+			 * parsed header fields so the state machine passes through cleanly.
+			 */
+			header_length = 0;
+			end_frame = 0;
+			frame_id = host_data->expect_frame_id;
+			presentation_time = host_data->current_frame_timestamp;
+		} else {
+			/* First transfer carries a valid UVC header. Force FID match and reset
+			 * EOF so frame boundary detection is driven by JPEG EOI, not the header.
+			 */
+			frame_id = host_data->expect_frame_id;
+			end_frame = 0;
+			host_data->bulk_raw_mode = true;
+		}
+		host_data->save_picture = true;
+	}
 
 	if (buf->len <= UVC_PAYLOAD_HEADER_MIN_SIZE) {
 		goto cleanup;
@@ -1625,13 +1802,13 @@ static int stream_iso_req_cb(struct usb_device *const dev, struct uhc_transfer *
 
 	if (data_size > 0) {
 		if (vbuf->bytesused == 0U) {
-			if (host_data->current_frame_timestamp != presentation_time) {
-				host_data->current_frame_timestamp = presentation_time;
-			}
-		} else if (presentation_time != host_data->current_frame_timestamp) {
+			host_data->current_frame_timestamp = presentation_time;
+		} else if (presentation_time != 0U &&
+			   host_data->current_frame_timestamp != 0U &&
+			   presentation_time != host_data->current_frame_timestamp) {
+			/* Only drop on genuine PTS change: both the stored and current
+			 * timestamps must be non-zero (zero means PTS flag was absent). */
 			host_data->save_picture = false;
-		} else {
-			/* Normal frame continuation */
 		}
 
 		if (host_data->save_picture && vbuf != NULL) {
@@ -1646,6 +1823,36 @@ static int stream_iso_req_cb(struct usb_device *const dev, struct uhc_transfer *
 				       (void *)(((uint8_t *)buf->data) + header_length), data_size);
 				vbuf->bytesused += data_size;
 				host_data->vbuf_offset = vbuf->bytesused;
+
+				if (stream_info->is_bulk && data_size > 0) {
+					if (host_data->current_format.video_fmt.pixelformat ==
+					    VIDEO_PIX_FMT_JPEG) {
+						/* MJPEG bulk: scan for JPEG EOI to detect frame end */
+						size_t old_used = vbuf->bytesused - data_size;
+						uint8_t *jpeg_new = (uint8_t *)vbuf->buffer + old_used;
+
+						if (old_used > 0 && jpeg_new[-1] == 0xFF &&
+						    jpeg_new[0] == 0xD9) {
+							vbuf->bytesused = old_used + 1;
+							end_frame = UVC_BMHEADERINFO_END_OF_FRAME;
+						} else {
+							for (size_t i = 0; i + 1 < data_size; i++) {
+								if (jpeg_new[i] == 0xFF &&
+								    jpeg_new[i + 1] == 0xD9) {
+									vbuf->bytesused = old_used + i + 2;
+									end_frame =
+										UVC_BMHEADERINFO_END_OF_FRAME;
+									break;
+								}
+							}
+						}
+					} else if (vbuf->bytesused >=
+						   host_data->current_format.video_fmt.size) {
+						/* Uncompressed bulk: complete when expected size reached */
+						end_frame = UVC_BMHEADERINFO_END_OF_FRAME;
+					}
+					host_data->vbuf_offset = vbuf->bytesused;
+				}
 
 				LOG_DBG("Processed %u payload bytes (FID:%u), total: %u, EOF: %u",
 					data_size, frame_id, vbuf->bytesused, end_frame);
@@ -1697,6 +1904,20 @@ static int stream_iso_req_cb(struct usb_device *const dev, struct uhc_transfer *
 		goto cleanup;
 	}
 
+	/* Set line_offset so partial-frame cameras position each stripe correctly */
+	{
+		uint32_t pitch = host_data->current_format.video_fmt.pitch;
+		uint32_t full_size = host_data->current_format.video_fmt.size;
+
+		vbuf->line_offset = (pitch > 0U)
+					     ? (uint16_t)(host_data->frame_byte_offset / pitch)
+					     : 0U;
+		host_data->frame_byte_offset += vbuf->bytesused;
+		if (host_data->frame_byte_offset >= full_size) {
+			host_data->frame_byte_offset = 0U;
+		}
+	}
+
 	(void)k_fifo_get(&host_data->fifo_in, K_NO_WAIT);
 	k_fifo_put(&host_data->fifo_out, vbuf);
 
@@ -1716,15 +1937,17 @@ static int stream_iso_req_cb(struct usb_device *const dev, struct uhc_transfer *
 		vbuf->bytesused = 0;
 		memset(vbuf->buffer, 0, vbuf->size);
 		host_data->current_vbuf = vbuf;
+	} else {
+		/* fifo_in starved; keep transfers flowing and wait for usbh_uvc_enqueue */
+		host_data->current_vbuf = NULL;
 	}
 
 	k_mutex_unlock(&host_data->lock);
 
 cleanup:
 	net_buf_unref(buf);
-	if ((atomic_test_bit(&host_data->device_flags, UVC_DEVICE_FLAG_STREAMING)) &&
-	    (vbuf != NULL)) {
-		continue_transfer(host_data, xfer, vbuf);
+	if (atomic_test_bit(&host_data->device_flags, UVC_DEVICE_FLAG_STREAMING)) {
+		(void)continue_transfer(host_data, xfer, NULL);
 	}
 
 	return 0;
@@ -3033,14 +3256,23 @@ static int usbh_uvc_set_stream(const struct device *dev, bool enable, enum video
 		k_mutex_unlock(&host_data->lock);
 	}
 
-	ret = usbh_device_interface_set(host_data->udev, interface_num, alt, false);
-	if (ret != 0) {
-		LOG_ERR("Failed to set interface %d alt setting %d: %d", interface_num, alt, ret);
-		return ret;
+	/* For bulk cameras: skip SET_INTERFACE on the enable path — VS_COMMIT already armed the
+	 * device for streaming. Sending SET_INTERFACE(0) here would reset its streaming state
+	 * and cause it to NAK all subsequent bulk IN tokens. On the disable path, always send
+	 * SET_INTERFACE(0) so the camera properly releases its streaming resources.
+	 */
+	if (!stream_info->is_bulk || !enable) {
+		ret = usbh_device_interface_set(host_data->udev, interface_num, alt, false);
+		if (ret != 0) {
+			LOG_ERR("Failed to set interface %d alt setting %d: %d", interface_num, alt,
+				ret);
+			return ret;
+		}
 	}
 
 	if (enable) {
 		atomic_set_bit(&host_data->device_flags, UVC_DEVICE_FLAG_STREAMING);
+		host_data->bulk_raw_mode = false;
 
 		k_mutex_lock(&host_data->lock, K_FOREVER);
 
@@ -3049,7 +3281,12 @@ static int usbh_uvc_set_stream(const struct device *dev, bool enable, enum video
 			vbuf->bytesused = 0;
 			memset(vbuf->buffer, 0, vbuf->size);
 			host_data->current_vbuf = vbuf;
-			host_data->multi_prime_cnt = CONFIG_USBH_VIDEO_CONCURRENT_TRANSFERS;
+			/* Bulk streaming is a reliable ordered stream — one in-flight
+			 * transfer is sufficient and avoids excessive buffer allocation.
+			 */
+			host_data->multi_prime_cnt = stream_info->is_bulk
+							     ? 1
+							     : CONFIG_USBH_VIDEO_CONCURRENT_TRANSFERS;
 			while (host_data->multi_prime_cnt > 0) {
 				ret = initiate_transfer(host_data, vbuf);
 				if (ret != 0) {
@@ -3095,6 +3332,14 @@ static int usbh_uvc_enqueue(const struct device *dev, struct video_buffer *const
 	vbuf->line_offset = 0;
 
 	k_fifo_put(&host_data->fifo_in, vbuf);
+
+	if (atomic_test_bit(&host_data->device_flags, UVC_DEVICE_FLAG_STREAMING)) {
+		k_mutex_lock(&host_data->lock, K_FOREVER);
+		if (host_data->current_vbuf == NULL) {
+			host_data->current_vbuf = vbuf;
+		}
+		k_mutex_unlock(&host_data->lock);
+	}
 
 	return 0;
 }

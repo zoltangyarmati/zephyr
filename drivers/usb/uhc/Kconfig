@@ -27,10 +27,12 @@ config UHC_BUF_COUNT
 
 config UHC_BUF_POOL_SIZE
 	int "Memory available for buffers"
-	range 64 32768
+	range 64 524288
 	default 1024
 	help
 	  Total amount of memory available for UHC buffers.
+	  Bulk streaming (e.g. UVC bulk cameras) may require buffers sized to
+	  dwMaxPayloadTransferSize, which can exceed the 32 KiB isochronous limit.
 
 config UHC_BUF_FORCE_NOCACHE
 	bool
@@ -46,5 +48,6 @@ source "subsys/logging/Kconfig.template.log_config"
 source "drivers/usb/uhc/Kconfig.max3421e"
 source "drivers/usb/uhc/Kconfig.virtual"
 source "drivers/usb/uhc/Kconfig.mcux"
+source "drivers/usb/uhc/Kconfig.stm32"
 
 endif # UHC_DRIVER
