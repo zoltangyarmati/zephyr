@@ -1,0 +1,80 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Zoltan Gyarmati
+# SPDX-License-Identifier: Apache-2.0
+
+description: |
+  Analog Devices AD7730 / AD7730L 24-bit sigma-delta ADC for bridge transducers.
+
+  The device uses a custom SPI protocol where every read or write must be
+  preceded by a write to the Communications Register (register 0). SPI mode
+  is CPOL=0, CPHA=1 (Mode 1) when the POL pin is strapped low (the common
+  case); verify against the datasheet's "Serial Interface" section for your
+  board's POL strap.
+
+  Unlike a general-purpose mux'd ADC, the AD7730 has no freely selectable
+  analog input pins: each channel node's `reg` selects one of four dedicated
+  input pairings (see include/zephyr/dt-bindings/adc/ad7730-adc.h), so this
+  binding does not need CONFIG_ADC_CONFIGURABLE_INPUTS / input-positive /
+  input-negative.
+
+  Example:
+
+  &spi4 {
+      status = "okay";
+
+      ad7730: ad7730@0 {
+          compatible = "adi,ad7730-adc";
+          reg = <0>;
+          spi-max-frequency = <1000000>;
+          drdy-gpios = <&gpioe 3 GPIO_ACTIVE_LOW>;
+          vref-mv = <2500>;
+          status = "okay";
+
+          #address-cells = <1>;
+          #size-cells = <0>;
+          #io-channel-cells = <1>;
+
+          channel@0 {
+              reg = <AD7730_CH_1>;
+              zephyr,gain = "ADC_GAIN_1";
+              zephyr,reference = "ADC_REF_EXTERNAL0";
+              zephyr,acquisition-time = <ADC_ACQ_TIME_DEFAULT>;
+              zephyr,resolution = <24>;
+              zephyr,differential;
+          };
+      };
+  };
+
+compatible: "adi,ad7730-adc"
+
+include: [adc-controller.yaml, spi-device.yaml]
+
+io-channel-cells:
+  - input
+
+properties:
+  drdy-gpios:
+    type: phandle-array
+    description: |
+      GPIO connected to the AD7730 /DRDY signal. When CS is deasserted the
+      DOUT pin goes low to indicate a conversion result is ready; route this
+      signal to a GPIO for interrupt-driven conversion completion. Configure
+      with GPIO_ACTIVE_LOW. Falls back to status-register polling if absent.
+
+  vref-mv:
+    type: int
+    enum: [2500, 5000]
+    default: 2500
+    description: |
+      External reference voltage wired to the board's REFIN pins. Selects
+      the HIREF bit in the Mode Register, which affects the reference input
+      buffer, not an internal reference source — the AD7730 has none.
+
+  unipolar:
+    type: boolean
+    description: |
+      If true, the ADC operates in unipolar mode (0 to +Vfs output coding).
+      Default is bipolar (-Vfs to +Vfs, offset binary), matching the chip's
+      power-on reset default and typical load-cell bridge usage.
+
+  reg:
+    required: true

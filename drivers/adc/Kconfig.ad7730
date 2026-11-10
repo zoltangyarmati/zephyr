@@ -1,0 +1,69 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Zoltan Gyarmati
+# SPDX-License-Identifier: Apache-2.0
+
+config ADC_AD7730
+	bool "Analog Devices AD7730 sigma-delta ADC driver"
+	default y
+	depends on DT_HAS_ADI_AD7730_ADC_ENABLED
+	select SPI
+	select GPIO
+	help
+	  Enable driver for the AD7730/AD7730L 24-bit sigma-delta ADC from
+	  Analog Devices. Implements the standard Zephyr ADC driver API
+	  (channel_setup/read/read_async); sinc filter tuning, burnout
+	  detection, self-/system-calibration, and continuous free-running
+	  streaming are exposed through the vendor extension API in ad7730.h.
+
+if ADC_AD7730
+
+config ADC_AD7730_INIT_PRIORITY
+	int "AD7730 driver initialisation priority"
+	default 80
+	help
+	  Device initialisation priority within the POST_KERNEL phase.
+	  Must be higher than the SPI controller priority.
+
+config ADC_AD7730_LOG_LEVEL
+	int "AD7730 driver log level"
+	default 3
+	range 0 4
+	help
+	  Log verbosity: 0=off, 1=ERR, 2=WRN, 3=INF, 4=DBG.
+
+config ADC_AD7730_CONVERSION_TIMEOUT_MS
+	int "Single-conversion timeout (ms)"
+	default 1000
+	help
+	  Maximum time to wait for a single conversion (adc_read()/
+	  adc_read_async(), one channel) to complete before returning
+	  -ETIMEDOUT.
+
+config ADC_AD7730_ACQUISITION_THREAD_PRIO
+	int "ADC data acquisition thread priority"
+	default 0
+	depends on ADC_ASYNC
+
+config ADC_AD7730_ACQUISITION_THREAD_STACK_SIZE
+	int "Stack size for the ADC data acquisition thread"
+	default 512
+	depends on ADC_ASYNC
+	help
+	  Size of the stack used for the internal data acquisition thread.
+
+config ADC_AD7730_STREAM_THREAD_PRIO
+	int "Continuous-streaming thread priority"
+	default 0
+	help
+	  Priority of the thread that delivers ad7730_stream_start() results.
+
+config ADC_AD7730_STREAM_THREAD_STACK_SIZE
+	int "Stack size for the continuous-streaming thread"
+	default 2048
+	help
+	  Size of the stack used by the thread backing ad7730_stream_start()/
+	  ad7730_stream_stop(). The ad7730_stream_cb_t callback runs directly
+	  on this thread, so size it for whatever the callback does, not just
+	  the driver's own SPI I/O — e.g. the shell's demo callback alone
+	  needs well over 512 bytes once shell_fprintf() is on the stack.
+
+endif # ADC_AD7730
